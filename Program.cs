@@ -9,48 +9,48 @@ class Program
     {
         try
         {
-            // Inicijalizacija sistema (čita konfiguraciju)
             var system = new ProcessingSystem("SystemConfig.xml");
-            Console.WriteLine("Sistem konfigurisan.");
 
-            // --- DEO KOJI UCITAVA POSLOVE IZ POSEBNOG XML-A ---
-            string jobsPath = "Poslovi.xml";
-            if (File.Exists(jobsPath))
+            // Inicijalno učitavanje iz Poslovi.xml
+            if (File.Exists("Poslovi.xml"))
             {
-                Console.WriteLine("Učitavam inicijalne poslove iz Poslovi.xml...");
-                var doc = XDocument.Load(jobsPath);
+                var doc = XDocument.Load("Poslovi.xml");
                 foreach (var jElem in doc.Root.Elements("Job"))
                 {
-                    var job = new Job
+                    system.Submit(new Job
                     {
-                        Id = Guid.NewGuid(),
                         Type = Enum.Parse<JobType>(jElem.Element("Type").Value),
                         Priority = int.Parse(jElem.Element("Priority").Value),
                         Payload = jElem.Element("Payload").Value
-                    };
-                    system.Submit(job); // Ovo ubacuje posao u sistem
+                    });
                 }
             }
 
-            // --- DEO KOJI POKREĆE NITI ZA NASUMIČNO DODAVANJE ---
+            // Simulacija nasumičnog dodavanja iz više niti
             Random rnd = new Random();
-            for (int i = 0; i < 3; i++) // 3 niti koje stalno dodaju
+            for (int i = 0; i < 3; i++)
             {
                 int nitId = i;
                 _ = Task.Run(async () => {
                     while (true)
                     {
-                        var j = new Job { Type = JobType.IO, Payload = "Novi", Priority = rnd.Next(1, 5) };
-                        var res = system.Submit(j);
-                        if (res == null) Console.WriteLine($"[Nit {nitId}] Red pun!");
+                        bool isIo = rnd.Next(0, 2) == 0;
+                        var j = new Job
+                        {
+                            Type = isIo ? JobType.IO : JobType.Prime,
+                            Priority = rnd.Next(1, 11),
+                            Payload = isIo ? "delay:300" : "limit:5000,threads:4"
+                        };
+                        var h = system.Submit(j);
+                        if (h == null) Console.WriteLine($"[Nit {nitId}] Red pun.");
                         await Task.Delay(rnd.Next(1000, 3000));
                     }
                 });
             }
 
-            Console.WriteLine("Sve radi. Pritisni Enter za kraj.");
+            Console.WriteLine("Sistem pokrenut. Pritisni Enter za izlaz.");
             Console.ReadLine();
         }
-        catch (Exception ex) { Console.WriteLine("Greska: " + ex.Message); }
+        catch (Exception ex) { Console.WriteLine("Greška: " + ex.Message); }
     }
 }

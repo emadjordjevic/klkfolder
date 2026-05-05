@@ -25,71 +25,56 @@ public class ProcessingSystem
     public event EventHandler<JobEventArgs> JobFailed;
 
     public ProcessingSystem(string configPath)
-    { 
-        if (!File.Exists(configPath))
-        {
-            
-            _workerCount = 3;
-            _maxQueueSize = 10;
-        }
-        else
+    {
+        if (File.Exists(configPath))
         {
             var doc = XDocument.Load(configPath);
             _workerCount = int.Parse(doc.Root.Element("WorkerCount").Value);
             _maxQueueSize = int.Parse(doc.Root.Element("MaxQueueSize").Value);
+        }
+        else
+        {
+            _workerCount = 3;
+            _maxQueueSize = 10;
         }
 
         JobCompleted += async (s, e) => await LogAction(e);
         JobFailed += async (s, e) => await LogAction(e);
 
         StartWorkers();
-        Task.Run(RunReportingCycle);
-    }
-
-    
-    public Job GetJob(Guid id)
-    {
-        _activeJobs.TryGetValue(id, out var job);
-        return job;
+        _ = Task.Run(RunReportingCycle);
     }
 
     public JobHandle Submit(Job job)
     {
         lock (_lock)
         {
-          
-            if (_activeJobs.ContainsKey(job.Id) || _processedJobs.ContainsKey(job.Id))
-            {
-                return null; // Vraća null ako posao već postoji, što test i očekuje
-            }
-
-            if (_activeJobs.Count >= _maxQueueSize)
-            {
-                return null;
-            }
+            if (_activeJobs.ContainsKey(job.Id) || _processedJobs.ContainsKey(job.Id)) return null;
+            if (_activeJobs.Count >= _maxQueueSize) return null;
 
             _activeJobs.TryAdd(job.Id, job);
-            _queue.Enqueue(job, job.Priority);
+            _queue.Enqueue(job, -job.Priority); // Veći broj = veći prioritet
             _signal.Release();
 
             var tcs = new TaskCompletionSource<int>();
-            Task.Run(() => ExecuteWithRetry(job, tcs));
+            _ = Task.Run(() => ExecuteWithRetry(job, tcs));
             return new JobHandle(job.Id, tcs.Task);
         }
     }
 
     private async Task ExecuteWithRetry(Job job, TaskCompletionSource<int> tcs)
     {
-        for (int i = 1; i <= 3; i++) 
+        for (int i = 1; i <= 3; i++)
         {
             var sw = Stopwatch.StartNew();
             try
             {
-                using (var cts = new CancellationTokenSource(2000)) 
+                var workTask = Task.Run(() => PerformWork(job));
+                // Timeout na 2 sekunde
+                if (await Task.WhenAny(workTask, Task.Delay(2000)) == workTask)
                 {
-                    int result = await Task.Run(() => PerformWork(job), cts.Token);
+                    int result = await workTask;
                     sw.Stop();
-
                     _processedJobs.TryAdd(job.Id, 0);
                     _activeJobs.TryRemove(job.Id, out _);
 
@@ -104,21 +89,23 @@ public class ProcessingSystem
                     tcs.SetResult(result);
                     return;
                 }
+                throw new TimeoutException();
             }
             catch
             {
                 sw.Stop();
-                if (i == 3) 
+                if (i == 3) // Posle trećeg fail-a
                 {
                     JobFailed?.Invoke(this, new JobEventArgs
                     {
                         Id = job.Id,
                         Status = "ABORT",
                         Type = job.Type,
-                        DurationMs = sw.ElapsedMilliseconds
+                        DurationMs = sw.ElapsedMilliseconds,
+                        Result = -1
                     });
                     _activeJobs.TryRemove(job.Id, out _);
-                    tcs.SetException(new Exception("Failed after 3 retries"));
+                    tcs.SetException(new Exception("ABORT"));
                 }
             }
         }
@@ -126,17 +113,54 @@ public class ProcessingSystem
 
     private int PerformWork(Job job)
     {
-        
-        if (job.Type == JobType.Prime) return 42;
-        Thread.Sleep(100);
-        return new Random().Next(1, 100);
+        if (job.Type == JobType.IO)
+        {
+            // Parsiranje: "delay:500"
+            int delay = int.Parse(job.Payload.Split(':')[1]);
+            Thread.Sleep(delay);
+            return new Random().Next(0, 101);
+        }
+        else // Prime
+        {
+            // Parsiranje: "limit:1000,threads:4"
+            var parts = job.Payload.Split(',');
+            int limit = int.Parse(parts[0].Split(':')[1]);
+            int threads = Math.Clamp(int.Parse(parts[1].Split(':')[1]), 1, 8);
+
+            int count = 0;
+            Parallel.For(2, limit + 1, new ParallelOptions { MaxDegreeOfParallelism = threads }, i =>
+            {
+                bool isPrime = true;
+                for (int j = 2; j * j <= i; j++) if (i % j == 0) { isPrime = false; break; }
+                if (isPrime) Interlocked.Increment(ref count);
+            });
+            return count;
+        }
+    }
+
+    public IEnumerable<Job> GetTopJobs(int n)
+    {
+        lock (_lock)
+        {
+            return _queue.UnorderedItems
+                .Select(x => x.Element)
+                .OrderByDescending(j => j.Priority)
+                .Take(n)
+                .ToList();
+        }
+    }
+
+    public Job GetJob(Guid id)
+    {
+        _activeJobs.TryGetValue(id, out var job);
+        return job;
     }
 
     private void StartWorkers()
     {
         for (int i = 0; i < _workerCount; i++)
         {
-            Task.Run(async () => {
+            _ = Task.Run(async () => {
                 while (true)
                 {
                     await _signal.WaitAsync();
@@ -150,26 +174,27 @@ public class ProcessingSystem
     {
         while (true)
         {
-            await Task.Delay(60000); // Svakih 60 sekundi generiše XML
+            await Task.Delay(60000); // 1 minut
             GenerateXmlReport();
         }
     }
 
     private void GenerateXmlReport()
     {
-        List<JobEventArgs> stats;
-        lock (_history) stats = _history.ToList();
-
-        var report = new XElement("Report",
-            new XElement("Summary",
-                new XAttribute("Total", stats.Count),
-                new XAttribute("Success", stats.Count(x => x.Status == "Success")),
-                new XAttribute("Failed", stats.Count(x => x.Status == "ABORT"))
-            )
-        );
-
-        // Kružni bafer za 10 fajlova
-        report.Save($"Report_{_reportCounter++ % 10}.xml");
+        lock (_history)
+        {
+            var report = new XElement("Report",
+                new XElement("Stats",
+                    _history.GroupBy(x => x.Type).Select(g => new XElement("JobGroup",
+                        new XAttribute("Type", g.Key),
+                        new XAttribute("Executed", g.Count(x => x.Status == "Success")),
+                        new XAttribute("AvgTime", g.Where(x => x.Status == "Success").Any() ? g.Average(x => x.DurationMs) : 0),
+                        new XAttribute("Failed", g.Count(x => x.Status == "ABORT"))
+                    ))
+                )
+            );
+            report.Save($"Report_{_reportCounter++ % 10}.xml");
+        }
     }
 
     private async Task LogAction(JobEventArgs e)
@@ -177,8 +202,8 @@ public class ProcessingSystem
         await _logLock.WaitAsync();
         try
         {
-            string entry = $"[{DateTime.Now:HH:mm:ss}] ({e.Status}) ID: {e.Id}{Environment.NewLine}";
-            await File.AppendAllTextAsync("system.log", entry); // Asinhrono pisanje u log
+            string entry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{e.Status}] {e.Id}, {e.Result}{Environment.NewLine}";
+            await File.AppendAllTextAsync("system.log", entry);
             lock (_history) _history.Add(e);
         }
         finally { _logLock.Release(); }
