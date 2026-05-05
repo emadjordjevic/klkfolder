@@ -1,0 +1,12 @@
+﻿<InitialJobs>
+	<Job>
+		<Type>IO</Type>
+		<Priority>1</Priority>
+		<Payload>Inicijalni iz fajla 1</Payload>
+	</Job>
+	<Job>
+		<Type>Prime</Type>
+		<Priority>5</Priority>
+		<Payload>Inicijalni iz fajla 2</Payload>
+	</Job>
+</InitialJobs>
