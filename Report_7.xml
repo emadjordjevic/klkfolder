@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Report>
+  <Completed>
+    <Prime>2</Prime>
+    <IO>270</IO>
+  </Completed>
+  <Failed>
+    <Prime>272</Prime>
+  </Failed>
+</Report>
